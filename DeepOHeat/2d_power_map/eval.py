@@ -51,7 +51,9 @@ global_params = {
 
 print("Evaluating trained DeepOHeat: arbitrary 2d power map")
 
-device = "cuda:3"
+device = os.environ.get(
+    "DEEPOHEAT_DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu"
+)
 model = modules.DeepONet(
     trunk_in_features=3,
     trunk_hidden_features=128,
@@ -74,7 +76,7 @@ epoch = 10000
 model_dir = os.path.join(
     root_path, experiment_name, "checkpoints", "model_epoch_{}.pth".format(epoch)
 )
-checkpoint = torch.load(model_dir)
+checkpoint = torch.load(model_dir, map_location=device)
 model.load_state_dict(checkpoint["model"])
 model.eval()
 

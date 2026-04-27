@@ -51,7 +51,9 @@ global_params = {
 
 print("Evaluating the DeepOHeat prototype: inference on given power map files")
 
-device = "cuda:3"
+device = os.environ.get(
+    "DEEPOHEAT_DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu"
+)
 model = modules.DeepONet(
     trunk_in_features=3,
     trunk_hidden_features=128,
