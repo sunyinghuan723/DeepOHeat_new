@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Package-level DeepOHeat adapter for ChipletPart thermal instances.
+"""Legacy 2D power-map DeepOHeat adapter for ChipletPart thermal instances.
 
-This MVP adapter maps ChipletPart's package JSON to the pretrained
+This compatibility adapter maps ChipletPart's package JSON to the pretrained
 DeepOHeat 2D power-map DeepONet input. The mapping is intentionally narrow:
 chiplet/package metadata is preserved in the JSON, while the neural model
 currently consumes only the top-surface power-density channel resampled to the
