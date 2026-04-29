@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from dataset import DEFAULT_CHANNELS, load_instance_tensor, normalized_coords
+from device import device_metadata, resolve_device
 from model import PackageThermalDeepONet
 
 
@@ -22,7 +23,7 @@ def main() -> None:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path)
-    parser.add_argument("--device", default=None)
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--dump_field", action="store_true")
     args = parser.parse_args()
 
@@ -31,7 +32,7 @@ def main() -> None:
     if not args.instance.exists():
         raise SystemExit(f"thermal instance not found: {args.instance}")
 
-    device = torch.device(args.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
+    device = resolve_device(args.device)
     checkpoint = torch.load(args.model, map_location=device)
     config = checkpoint.get("config", {})
     if args.config and args.config.exists():
@@ -44,7 +45,12 @@ def main() -> None:
     model = PackageThermalDeepONet(
         len(channels),
         feature_dim=int(config.get("feature_dim", 64)),
+        branch_dim=int(config.get("branch_dim", config.get("feature_dim", 64))),
+        trunk_dim=int(config.get("trunk_dim", config.get("feature_dim", 64))),
         hidden_dim=int(config.get("hidden_dim", 128)),
+        num_layers=int(config.get("num_layers", 2)),
+        dropout=float(config.get("dropout", 0.0)),
+        use_batchnorm=bool(config.get("use_batchnorm", False)),
     ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
@@ -54,6 +60,8 @@ def main() -> None:
     start = time.perf_counter()
     with torch.no_grad():
         field = model(x, coords).reshape(grid_y, grid_x).detach().cpu().numpy()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     runtime = time.perf_counter() - start
 
     field_path = ""
@@ -67,6 +75,8 @@ def main() -> None:
         "field_path": field_path,
         "runtime_sec": float(runtime),
         "model_type": "package_thermal",
+        "device": str(device),
+        **{k: v for k, v in device_metadata(device).items() if k != "device"},
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as f:

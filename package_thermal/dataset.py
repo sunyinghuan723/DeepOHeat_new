@@ -80,6 +80,13 @@ class PackageThermalDataset(Dataset):
         if not self.records:
             raise ValueError(f"no records found in {manifest} for split={split}")
         self.channel_names = list(channel_names or DEFAULT_CHANNELS)
+        self.manifest_dir = Path(manifest).resolve().parent
+
+    def _resolve_path(self, value: str | Path) -> Path:
+        path = Path(value)
+        if path.is_absolute():
+            return path
+        return self.manifest_dir / path
 
     def __len__(self) -> int:
         return len(self.records)
@@ -88,8 +95,8 @@ class PackageThermalDataset(Dataset):
         record = self.records[index]
         if not record.get("label_path"):
             raise ValueError(f"record {record.get('instance_id')} has no label_path")
-        tensor = load_instance_tensor(record["json_path"], self.channel_names)
-        label = load_label(record["label_path"])
+        tensor = load_instance_tensor(self._resolve_path(record["json_path"]), self.channel_names)
+        label = load_label(self._resolve_path(record["label_path"]))
         return {
             "x": torch.from_numpy(tensor),
             "temperature": torch.from_numpy(label),
