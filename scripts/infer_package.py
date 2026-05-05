@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -76,9 +77,55 @@ def _domain_definition():
     return [domain_0], global_params
 
 
-def _resize_to_sensor(np, power, grid_y, grid_x):
+def _resolve_device(torch, requested):
+    device = requested or os.environ.get("DEEPOHEAT_DEVICE", "auto")
+    if device == "auto":
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("requested --device cuda, but CUDA is not available")
+        return "cuda:0"
+    if device.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"requested --device {device}, but CUDA is not available")
+        try:
+            index = int(device.split(":", 1)[1])
+        except ValueError as exc:
+            raise RuntimeError(f"invalid CUDA device string: {device}") from exc
+        if index < 0 or index >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"requested --device {device}, but only "
+                f"{torch.cuda.device_count()} CUDA device(s) are visible"
+            )
+        return device
+    if device == "cpu":
+        return "cpu"
+    raise RuntimeError(f"unsupported --device value: {device}")
+
+
+def _load_config(path):
+    if not path:
+        return {}
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"thermal model config not found: {config_path}")
+    with config_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _grid_shape(instance):
+    grid = instance.get("grid", {})
+    grid_x = grid.get("x", instance.get("grid_x"))
+    grid_y = grid.get("y", instance.get("grid_y"))
+    if grid_x is None or grid_y is None:
+        raise KeyError("thermal instance is missing grid x/y dimensions")
+    return int(grid_y), int(grid_x)
+
+
+def _resize_to_sensor(np, power, grid_y, grid_x, power_scale=1.0, normalize=False):
     source = np.asarray(power, dtype=np.float32).reshape(grid_y, grid_x)
-    if np.max(np.abs(source)) > 0:
+    source = source * float(power_scale)
+    if normalize and source.size and np.max(np.abs(source)) > 0:
         source = source / np.max(np.abs(source))
 
     y_old = np.linspace(0.0, 1.0, grid_y)
@@ -88,23 +135,35 @@ def _resize_to_sensor(np, power, grid_y, grid_x):
 
     tmp = np.vstack([np.interp(x_new, x_old, row) for row in source])
     resized = np.vstack([np.interp(y_new, y_old, tmp[:, col]) for col in range(tmp.shape[1])]).T
-    return resized.reshape(-1, order="F")
+    return resized.reshape(-1, order="F"), source
 
 
 def infer(args):
     np, torch, dataio_deeponet, modules = _import_deepoheat()
+    config = _load_config(args.config)
 
     with open(args.instance, "r", encoding="utf-8") as f:
         instance = json.load(f)
 
-    grid = instance["grid"]
     channels = instance["channels"]
     power = channels["power_density_w_per_mm2"]
-    sensor = _resize_to_sensor(np, power, grid["y"], grid["x"])
-
-    device = args.device or os.environ.get(
-        "DEEPOHEAT_DEVICE", "cuda:0" if torch.cuda.is_available() else "cpu"
+    grid_y, grid_x = _grid_shape(instance)
+    power_scale = (
+        args.power_scale
+        if args.power_scale is not None
+        else float(config.get("power_scale", 1.0))
     )
+    normalize_power = bool(args.normalize_power or config.get("normalize_power", False))
+    sensor, scaled_power_grid = _resize_to_sensor(
+        np,
+        power,
+        grid_y,
+        grid_x,
+        power_scale=power_scale,
+        normalize=normalize_power,
+    )
+
+    device = _resolve_device(torch, args.device)
     model = modules.DeepONet(
         trunk_in_features=3,
         trunk_hidden_features=128,
@@ -133,20 +192,44 @@ def infer(args):
     beta = torch.tensor(sensor.reshape(1, -1).repeat(coords.shape[0], 0), device=device).float()
     eval_data = {"coords": coords, "beta": beta}
 
+    start = time.perf_counter()
     with torch.no_grad():
         u = model(eval_data)["model_out"].detach().cpu().numpy().reshape(-1)
+    if str(device).startswith("cuda"):
+        torch.cuda.synchronize(torch.device(device))
+    runtime_sec = time.perf_counter() - start
 
     ambient = float(instance.get("boundary_conditions", {}).get("ambient_temperature", 293.15))
-    temperatures = ambient + 25.0 * u
+    temperature_scale = float(config.get("temperature_scale", 25.0))
+    temperatures = ambient + temperature_scale * u
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    field_path = str(output_path.with_suffix(".field.npz"))
+    np.savez_compressed(
+        field_path,
+        coords=coords.detach().cpu().numpy().astype(np.float32),
+        temperature=temperatures.astype(np.float32),
+        sensor=sensor.reshape(21, 21, order="F").astype(np.float32),
+        scaled_power_grid=scaled_power_grid.astype(np.float32),
+    )
+    gpu_name = ""
+    if torch.cuda.is_available() and str(device).startswith("cuda"):
+        gpu_name = torch.cuda.get_device_name(torch.device(device))
     result = {
         "t_max": float(np.max(temperatures)),
         "t_avg": float(np.mean(temperatures)),
-        "field_path": "",
+        "field_path": field_path,
         "adapter": "deeponet_2d_power_map_resampled",
+        "runtime_sec": float(runtime_sec),
+        "device": str(device),
+        "cuda_available": bool(torch.cuda.is_available()),
+        "cuda_device_count": int(torch.cuda.device_count()),
+        "gpu_name": gpu_name,
+        "power_scale": float(power_scale),
+        "normalize_power": normalize_power,
+        "temperature_scale": temperature_scale,
     }
 
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
 
@@ -157,6 +240,9 @@ def main():
     parser.add_argument("--model", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--config")
+    parser.add_argument("--power_scale", type=float)
+    parser.add_argument("--normalize_power", action="store_true")
     args = parser.parse_args()
     infer(args)
 
